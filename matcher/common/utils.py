@@ -9,6 +9,7 @@ def fix_randseed(seed):
     r""" Set random seeds for reproducibility """
     if seed is None:
         seed = int(random.random() * 1e5)
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)

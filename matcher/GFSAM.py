@@ -99,14 +99,14 @@ class GFSAM:
         ref_feats_sem, tar_feats_sem = self.extract_img_feats()
 
         # positive and negative similarity maps
-        neg_sim_map, neg_mean_sim_map = self.generate_prior(tar_feats_sem, ref_feats_sem, 1-self.ref_masks)
-        sim_map, mean_sim_map = self.generate_prior(tar_feats_sem, ref_feats_sem, self.ref_masks)
+        neg_max_sim_map, neg_mean_sim_map = self.generate_prior(tar_feats_sem, ref_feats_sem, 1-self.ref_masks)
+        max_sim_map, mean_sim_map = self.generate_prior(tar_feats_sem, ref_feats_sem, self.ref_masks)
 
         # mid-value of similarity map
         mean_sim_map_half = (mean_sim_map.max() + mean_sim_map.min()) / 2
 
         # mix the similarity map and align the value to [0, 1]
-        cross_sim_map = mean_sim_map * sim_map
+        cross_sim_map = mean_sim_map * max_sim_map
         cross_sim_map = (cross_sim_map - cross_sim_map.min()) / (cross_sim_map.max() - cross_sim_map.min() + 1e-6)
 
         neg_mean_sim_map_std = (neg_mean_sim_map - neg_mean_sim_map.min()) / (neg_mean_sim_map.max() - neg_mean_sim_map.min() + 1e-6)
@@ -134,7 +134,16 @@ class GFSAM:
         
         confidence = self.calc_confidence(ref_feats_sem, self.ref_masks, tar_feats_sem, pred_masks)
 
-        return pred_masks, (coord_xy, selected_points), confidence
+        dbg = {
+            "max_sim_map": max_sim_map.detach().cpu().squeeze(0),             # (h, w)
+            "mean_sim_map": mean_sim_map.detach().cpu().squeeze(0),           # (h, w)
+            "cross_sim_map": cross_sim_map.detach().cpu().squeeze(0),         # (h, w)
+            "neg_mean_sim_map": neg_mean_sim_map.detach().cpu().squeeze(0),   # (h, w)
+            "coord_xy": coord_xy,                                   # numpy, N×2
+            "coord_labels": coord_labels,                           # numpy, N
+        }
+
+        return pred_masks, (coord_xy, selected_points), confidence, dbg
     
     def calc_confidence(self, ref_feats_sem, ref_masks, tar_feats, pred_masks):
         """
