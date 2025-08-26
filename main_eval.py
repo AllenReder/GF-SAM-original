@@ -80,12 +80,44 @@ def draw_prompt(coord_xy):
     if coord_xy.shape[0] > 0:
         plt.legend(loc='upper right', fontsize=8)
 
+def add_confusion_matrix(original_matrix, gt, pred):
+    """
+    根据 gt 和 pred 计算出混淆矩阵, 加到原始混淆矩阵并返回
+    gt, pred: numpy array，shape一致，值为类别索引（0~num_classes-1）
+    original_matrix: shape=(num_classes, num_classes)
+    返回：更新后的混淆矩阵
+    """
+    num_classes = original_matrix.shape[0]
+    # 展平成一维
+    # 只统计合法类别
+    mask = (gt >= 0) & (gt < num_classes) & (pred >= 0) & (pred < num_classes)
+    inds = gt[mask] * num_classes + pred[mask]
+    batch_cm = np.bincount(inds, minlength=num_classes*num_classes).reshape(num_classes, num_classes)
+    return original_matrix + batch_cm
+
+
 def test(GFSAM, dataloader, args=None):
     r""" Test GFSAM """
 
     ### DEBUG 混淆矩阵
-    prompt_confusion_matrix = np.zeros((len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1, len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1), dtype=np.float32) # 提示点真实类别与预测类别的混淆矩阵
-    pixel_confusion_matrix = np.zeros((len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1, len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1), dtype=np.float32) # 实际标签与预测类别的混淆矩阵
+
+    class_labels = [0] + list(SUPP_CLASS_IDS[args.benchmark][args.fold])
+    num_classes = len(class_labels)
+    class_names = CLASS_NAME[args.benchmark]
+    class_names = [class_names[i] for i in class_labels] # 类别名
+    # 映射
+    label_to_index = dict()
+    for i, lbl in enumerate(class_labels):
+        label_to_index[int(lbl)] = i
+    vec_map = np.vectorize(lambda v: label_to_index.get(int(v), 0))
+
+    prompt_confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.float32) # 提示点真实类别与预测类别的混淆矩阵
+    pixel_confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.float32) # 真实类别与预测类别的混淆矩阵
+
+    ###
+    total_pixel_num = 0
+    overlap_pixel_num = np.zeros((num_classes, ), dtype=np.int32) # 被 k 个类别预测伪掩码重叠的像素数量
+    overlap_pixel_wrong_pred_num = np.zeros((num_classes, ), dtype=np.int32) # 被 k 个类别预测伪掩码重叠且预测错误的像素数量
 
     average_meter = AverageMeter(dataloader.dataset)
 
@@ -103,6 +135,13 @@ def test(GFSAM, dataloader, args=None):
         #     Logger.info(f"support_masks_{i+1} save: {f'debug/support_{i+1}.png'}")
 
         final_pred_mask = torch.zeros_like(query_mask)
+
+        ### DEBUG
+        overlap_count = torch.zeros(query_mask.shape[-2:], dtype=torch.int32) # 每个像素被不同类别掩码重叠的次数
+        overlap_might_right = torch.zeros(query_mask.shape[-2:], dtype=bool) # 像素被正确类别覆盖的掩码
+
+        # DEBUG
+        total_pixel_num += 1024 * 1024
 
         for supp_cls_idx in range(support_masks.shape[1]):
 
@@ -124,16 +163,7 @@ def test(GFSAM, dataloader, args=None):
             prompt_coord_xy = dbg["coord_xy"] # 属于 (1024, 1024) 坐标
             
 
-            ### 提示点混淆矩阵记录
-            class_labels = [0] + list(SUPP_CLASS_IDS[args.benchmark][args.fold])
-            num_classes = len(class_labels)
-            # 映射
-            label_to_index = dict()
-            for i, lbl in enumerate(class_labels):
-                label_to_index[int(lbl)] = i
-            
-            # 获取每个提示点在 query_mask 中的类别（向量化批量统计）
-            # prompt_coord_xy 可能包含浮点坐标，索引用于 mask 的索引必须为整数
+            ### DEBUG ---------- 提示点混淆矩阵记录 ---------- 
             query_mask_np = query_mask[0].cpu().squeeze(0).numpy().astype(np.int32)
             coords = prompt_coord_xy.astype(np.int64)
             xs = coords[:, 0]
@@ -147,15 +177,17 @@ def test(GFSAM, dataloader, args=None):
                 # 获取这些坐标上的真实标签
                 prompt_gt_labels = query_mask_np[ys, xs]
                 # 把真实标签映射为混淆矩阵索引（label_to_index），未知标签映射为 0（背景）
-                vec_map = np.vectorize(lambda v: label_to_index.get(int(v), 0))
-                gt_idx = vec_map(prompt_gt_labels)
+                gt = vec_map(prompt_gt_labels)
                 pred_idx = label_to_index.get(int(dataloader.dataset.supp_class_ids[supp_cls_idx]), 0)
-                # 使用 bincount 批量累加到 prompt_confusion_matrix
-                inds = gt_idx * num_classes + pred_idx
-                batch_cm = np.bincount(inds, minlength=num_classes*num_classes).reshape(num_classes, num_classes)
-                prompt_confusion_matrix += batch_cm
+                pred = np.ones_like(gt) * pred_idx
+                prompt_confusion_matrix = add_confusion_matrix(prompt_confusion_matrix, gt, pred)
 
-            ### 相似度图可视化
+            ### DEBUG ---------- 重叠记录 ---------- 
+            overlap_count[pred_mask[0].cpu() > 0] += 1
+            overlap_might_right[(pred_mask[0] > 0).cpu() & (query_mask[0].cpu() == dataloader.dataset.supp_class_ids[supp_cls_idx])] = 1
+
+
+            ### ---------- 相似度图可视化 ---------- 
             # cmap = plt.cm.get_cmap('nipy_spectral', 21)
             # bounds = np.arange(22) - 0.5
             # norm = mcolors.BoundaryNorm(bounds, cmap.N)
@@ -206,52 +238,28 @@ def test(GFSAM, dataloader, args=None):
             if confidence > 0.5:
                 final_pred_mask[pred_mask > 0] = dataloader.dataset.supp_class_ids[supp_cls_idx]
         
-        ### DEBUG
-        # show_image([query_img[0] * 255, query_mask[0].long(), final_pred_mask[0].long()], save='output.png')
-        # Logger.info(f"pred_mask save: {f'output.png'}")
-        # input()
-
         # 3. 评估预测结果
         area_inter, area_union = Evaluator.classify_prediction(final_pred_mask.clone(), batch)
         average_meter.update(area_inter, area_union)
         average_meter.write_process(idx, len(dataloader), write_batch_idx=1)
 
-        ### DEBUG 更新混淆矩阵
-        class_labels = [0] + list(SUPP_CLASS_IDS[args.benchmark][args.fold])
-        num_classes = len(class_labels)
-        class_names = CLASS_NAME[args.benchmark]
-        class_names = [class_names[i] for i in class_labels] # 类别名
-        # 映射
-        label_to_index = dict()
-        for i, lbl in enumerate(class_labels):
-            label_to_index[int(lbl)] = i
+        ### DEBUG ---------- 更新像素混淆矩阵 ----------
 
         # 使用第一张 query 的掩码
         query_mask = query_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)  # (H, W)
         final_pred_mask = final_pred_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)  # (H, W)
 
-        gt = np.zeros_like(query_mask)
-        pred = np.zeros_like(final_pred_mask)
-        for lbl, idx in label_to_index.items():
-            gt[query_mask == lbl] = idx
-            pred[final_pred_mask == lbl] = idx
+        gt = vec_map(query_mask).flatten()
+        pred = vec_map(final_pred_mask).flatten()
 
-        # 高效计算混淆矩阵
-        # 先用 bincount 计算当前 batch 的混淆矩阵，然后加到原始 pixel_confusion_matrix 上
-        flat_gt = gt.flatten()
-        flat_pred = pred.flatten()
-        mask = (flat_gt >= 0) & (flat_gt < num_classes) & (flat_pred >= 0) & (flat_pred < num_classes)
-        inds = flat_gt[mask] * num_classes + flat_pred[mask]
-        batch_cm = np.bincount(inds, minlength=num_classes*num_classes).reshape(num_classes, num_classes)
-        pixel_confusion_matrix += batch_cm
+        pixel_confusion_matrix = add_confusion_matrix(pixel_confusion_matrix, gt, pred)
         
         # 按每行归一化
         norm_pixel_confusion_matrix = pixel_confusion_matrix.copy()
         row_sum = norm_pixel_confusion_matrix.sum(axis=1, keepdims=True)
         norm_pixel_confusion_matrix = pixel_confusion_matrix / (row_sum + 1e-6)
-        print(f"norm_pixel_confusion_matrix.shape: {norm_pixel_confusion_matrix.shape} class_labels: {class_labels}")
 
-        # 绘制混淆矩阵热力图, 表明每个方块内的数值
+        ### DEBUG ---------- 可视化混淆矩阵 ----------
         plt.figure(figsize=(len(class_labels) * 2, len(class_labels) * 2))
         plt.imshow(norm_pixel_confusion_matrix, cmap='jet', vmin=0, vmax=1)
         plt.colorbar()
@@ -302,6 +310,68 @@ def test(GFSAM, dataloader, args=None):
         plt.savefig('debug/norm_prompt_confusion_matrix.png')
         plt.close()
 
+        ### DEBUG ---------- 重叠情况 ----------
+        # 任何被重叠区域
+        mask = ((overlap_count > 0) & (overlap_might_right > 0)).cpu().numpy()
+        overlap_pixel_num[0] += mask.sum()
+        wrong_pred = (query_mask != final_pred_mask) & mask
+        overlap_pixel_wrong_pred_num[0] += wrong_pred.sum()
+        for cnt in np.unique(overlap_count): # 被指定类别数量重叠区域
+            if cnt == 0:
+                continue
+            mask = ((overlap_count == cnt) & (overlap_might_right > 0)).cpu().numpy()
+            overlap_pixel_num[cnt] += mask.sum()
+            wrong_pred = (query_mask != final_pred_mask) & mask
+            overlap_pixel_wrong_pred_num[cnt] += wrong_pred.sum()
+
+        # 可视化overlap的两个数组的数据
+        # 获取重叠次数的范围
+        cnts = list(range(num_classes))
+        cnts = sorted(cnts)
+
+        overlap_nums = [overlap_pixel_num[cnt] / total_pixel_num for cnt in cnts]
+        overlap_wrong_nums = [overlap_pixel_wrong_pred_num[cnt] / total_pixel_num for cnt in cnts]
+
+        x = np.arange(len(cnts))  # 横坐标位置
+        width = 0.35  # 柱宽
+
+        plt.figure(figsize=(num_classes*2, 6))
+        bar1 = plt.bar(x - width/2, overlap_nums, width, label='overlap_pixel_num')
+        bar2 = plt.bar(x + width/2, overlap_wrong_nums, width, label='overlap_pixel_wrong_pred_num')
+
+        # 在bar上绘制数字
+        for rect in bar1:
+            height = rect.get_height()
+            plt.text(rect.get_x() + rect.get_width()/2, height, f'{height*100:.1f}%', ha='center', va='bottom', fontsize=10)
+        for rect in bar2:
+            height = rect.get_height()
+            plt.text(rect.get_x() + rect.get_width()/2, height, f'{height*100:.1f}', ha='center', va='bottom', fontsize=10)
+
+        # 在两个bar中间上方标注百分比（错误像素/重叠像素）
+        for i, (rect1, rect2) in enumerate(zip(bar1, bar2)):
+            total = overlap_nums[i]
+            wrong = overlap_wrong_nums[i]
+            if total > 0:
+                ratio = wrong / total
+                # 中点的 x：两根柱子中心的平均
+                mid_x = (rect1.get_x() + rect1.get_width()/2 + rect2.get_x() + rect2.get_width()/2) / 2
+                # y 放在两柱较高者之上，加一点偏移
+                top_y = max(rect1.get_height(), rect2.get_height())
+                plt.text(mid_x, top_y + 0.2, f'{ratio*100:.1f}%', ha='center', va='bottom', fontsize=10)
+
+        # 绘制total_pixel_num的横向虚线
+        plt.axhline(y=1, color='r', linestyle='--', label='total_pixel_num')
+
+        plt.xlabel('overlap count')
+        plt.ylabel('num')
+        plt.xticks(x, cnts)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig('debug/overlap_bar.png')
+        plt.close()
+
+
+
     # Write evaluation results
     average_meter.write_result(0)
     miou, fb_iou, _ = average_meter.compute_iou()
@@ -316,8 +386,7 @@ if __name__ == '__main__':
 
     # 数据集参数
     parser.add_argument('--datapath', type=str, default='datasets')
-    parser.add_argument('--benchmark', type=str, default='coco',
-                        choices=['coco', 'pascal'])
+    parser.add_argument('--benchmark', type=str, default='coco', choices=['coco', 'pascal'])
     parser.add_argument('--bsz', type=int, default=1)
     parser.add_argument('--nworker', type=int, default=0)
     parser.add_argument('--fold', type=int, default=0)
