@@ -15,7 +15,7 @@ from matcher.common.evaluation import Evaluator
 from matcher.common import utils
 from matcher.data.dataset import FSSDataset
 from matcher.GFSAM import build_model
-from matcher.data.task import SUPP_CLASS_IDS
+from matcher.data.task import SUPP_CLASS_IDS, CLASS_NAME
 
 from tool import *
 
@@ -25,6 +25,8 @@ random.seed(0)
 import cv2
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patheffects as path_effects
+import matplotlib.patches as patches
 
 # sim map
 def show_sim_map(sim_map, image):
@@ -81,6 +83,10 @@ def draw_prompt(coord_xy):
 def test(GFSAM, dataloader, args=None):
     r""" Test GFSAM """
 
+    ### DEBUG 混淆矩阵
+    prompt_confusion_matrix = np.zeros((len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1, len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1), dtype=np.float32) # 提示点真实类别与预测类别的混淆矩阵
+    pixel_confusion_matrix = np.zeros((len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1, len(SUPP_CLASS_IDS[args.benchmark][args.fold]) + 1), dtype=np.float32) # 实际标签与预测类别的混淆矩阵
+
     average_meter = AverageMeter(dataloader.dataset)
 
     for idx, batch in enumerate(dataloader):
@@ -115,56 +121,87 @@ def test(GFSAM, dataloader, args=None):
             mean_sim_map = dbg["mean_sim_map"]
             cross_sim_map = dbg["cross_sim_map"]
             neg_mean_sim_map = dbg["neg_mean_sim_map"]
-            coord_xy = dbg["coord_xy"] # 属于 (1024, 1024) 坐标
+            prompt_coord_xy = dbg["coord_xy"] # 属于 (1024, 1024) 坐标
+            
 
-            cmap = plt.cm.get_cmap('nipy_spectral', 21)
-            bounds = np.arange(22) - 0.5
-            norm = mcolors.BoundaryNorm(bounds, cmap.N)
-            # img & mask
-            plt.figure(figsize=(20, 10))
-            plt.subplot(2, 4, 1)
-            query_img_np = query_img[0].cpu().permute(1, 2, 0).numpy() # (1, 3, H, W) -> (H, W, 3)
-            draw_prompt(coord_xy)
-            plt.imshow(query_img_np)
-            plt.title(f'query_img')
-            plt.subplot(2, 4, 2)
-            query_mask_np = query_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)
-            plt.imshow(query_mask_np, cmap=cmap, norm=norm)
-            draw_prompt(coord_xy)
-            query_cls = list(np.unique(query_mask_np))
-            plt.title(f'query_mask: {query_cls}')
-            plt.subplot(2, 4, 3)
-            pred_mask_np = pred_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)
-            pred_mask_np[pred_mask_np > 0] = dataloader.dataset.supp_class_ids[supp_cls_idx]
-            plt.imshow(pred_mask_np, cmap=cmap, norm=norm)
-            draw_prompt(coord_xy)
-            plt.title(f'pred_mask_{dataloader.dataset.supp_class_ids[supp_cls_idx]}')
+            ### 提示点混淆矩阵记录
+            class_labels = [0] + list(SUPP_CLASS_IDS[args.benchmark][args.fold])
+            num_classes = len(class_labels)
+            # 映射
+            label_to_index = dict()
+            for i, lbl in enumerate(class_labels):
+                label_to_index[int(lbl)] = i
+            
+            # 获取每个提示点在 query_mask 中的类别（向量化批量统计）
+            # prompt_coord_xy 可能包含浮点坐标，索引用于 mask 的索引必须为整数
+            query_mask_np = query_mask[0].cpu().squeeze(0).numpy().astype(np.int32)
+            coords = prompt_coord_xy.astype(np.int64)
+            xs = coords[:, 0]
+            ys = coords[:, 1]
+            # 过滤越界坐标
+            h, w = query_mask_np.shape
+            valid_mask = (xs >= 0) & (xs < w) & (ys >= 0) & (ys < h)
+            if valid_mask.any():
+                xs = xs[valid_mask]
+                ys = ys[valid_mask]
+                # 获取这些坐标上的真实标签
+                prompt_gt_labels = query_mask_np[ys, xs]
+                # 把真实标签映射为混淆矩阵索引（label_to_index），未知标签映射为 0（背景）
+                vec_map = np.vectorize(lambda v: label_to_index.get(int(v), 0))
+                gt_idx = vec_map(prompt_gt_labels)
+                pred_idx = label_to_index.get(int(dataloader.dataset.supp_class_ids[supp_cls_idx]), 0)
+                # 使用 bincount 批量累加到 prompt_confusion_matrix
+                inds = gt_idx * num_classes + pred_idx
+                batch_cm = np.bincount(inds, minlength=num_classes*num_classes).reshape(num_classes, num_classes)
+                prompt_confusion_matrix += batch_cm
 
-            plt.subplot(2, 4, 4)
-            neg_mean_sim_map_std = (neg_mean_sim_map - neg_mean_sim_map.min()) / (neg_mean_sim_map.max() - neg_mean_sim_map.min() + 1e-6)
-            neg_region = neg_mean_sim_map_std > cross_sim_map
-            pos_region_sim = cross_sim_map * ~neg_region
-            show_sim_map(pos_region_sim, query_img_np)
-            draw_prompt(coord_xy)
-            plt.title('pos_region_sim')
-            plt.subplot(2, 4, 5)
-            show_sim_map(max_sim_map, query_img_np)
-            plt.title('max_sim_map')
-            plt.subplot(2, 4, 6)
-            show_sim_map(mean_sim_map, query_img_np)
-            plt.title('mean_sim_map')
-            plt.subplot(2, 4, 7)
-            show_sim_map(cross_sim_map, query_img_np)
-            plt.title('cross_sim_map')
-            plt.subplot(2, 4, 8)
-            show_sim_map(neg_mean_sim_map, query_img_np)
-            plt.title('neg_mean_sim_map')
+            ### 相似度图可视化
+            # cmap = plt.cm.get_cmap('nipy_spectral', 21)
+            # bounds = np.arange(22) - 0.5
+            # norm = mcolors.BoundaryNorm(bounds, cmap.N)
+            # # img & mask
+            # plt.figure(figsize=(20, 10))
+            # plt.subplot(2, 4, 1)
+            # query_img_np = query_img[0].cpu().permute(1, 2, 0).numpy() # (1, 3, H, W) -> (H, W, 3)
+            # draw_prompt(prompt_coord_xy)
+            # plt.imshow(query_img_np)
+            # plt.title(f'query_img')
+            # plt.subplot(2, 4, 2)
+            # query_mask_np = query_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)
+            # plt.imshow(query_mask_np, cmap=cmap, norm=norm)
+            # draw_prompt(prompt_coord_xy)
+            # query_cls = list(np.unique(query_mask_np))
+            # plt.title(f'query_mask: {query_cls}')
+            # plt.subplot(2, 4, 3)
+            # pred_mask_np = pred_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)
+            # pred_mask_np[pred_mask_np > 0] = dataloader.dataset.supp_class_ids[supp_cls_idx]
+            # plt.imshow(pred_mask_np, cmap=cmap, norm=norm)
+            # draw_prompt(prompt_coord_xy)
+            # plt.subplot(2, 4, 4)
+            # neg_mean_sim_map_std = (neg_mean_sim_map - neg_mean_sim_map.min()) / (neg_mean_sim_map.max() - neg_mean_sim_map.min() + 1e-6)
+            # neg_region = neg_mean_sim_map_std > cross_sim_map
+            # pos_region_sim = cross_sim_map * ~neg_region
+            # show_sim_map(pos_region_sim, query_img_np)
+            # draw_prompt(prompt_coord_xy)
+            # plt.title('pos_region_sim')
+            # plt.subplot(2, 4, 5)
+            # show_sim_map(max_sim_map, query_img_np)
+            # plt.title('max_sim_map')
+            # plt.subplot(2, 4, 6)
+            # show_sim_map(mean_sim_map, query_img_np)
+            # plt.title('mean_sim_map')
+            # plt.subplot(2, 4, 7)
+            # show_sim_map(cross_sim_map, query_img_np)
+            # plt.title('cross_sim_map')
+            # plt.subplot(2, 4, 8)
+            # show_sim_map(neg_mean_sim_map, query_img_np)
+            # plt.title('neg_mean_sim_map')
 
-            plt.tight_layout()
-            plt.savefig('debug.png')
+            # plt.tight_layout()
+            # plt.savefig('debug.png')
 
-            print(f"cls {supp_cls_idx} debug.png saved")
-            input()
+            # print(f"cls {supp_cls_idx} debug.png saved")
+            # input()
 
             if confidence > 0.5:
                 final_pred_mask[pred_mask > 0] = dataloader.dataset.supp_class_ids[supp_cls_idx]
@@ -178,6 +215,92 @@ def test(GFSAM, dataloader, args=None):
         area_inter, area_union = Evaluator.classify_prediction(final_pred_mask.clone(), batch)
         average_meter.update(area_inter, area_union)
         average_meter.write_process(idx, len(dataloader), write_batch_idx=1)
+
+        ### DEBUG 更新混淆矩阵
+        class_labels = [0] + list(SUPP_CLASS_IDS[args.benchmark][args.fold])
+        num_classes = len(class_labels)
+        class_names = CLASS_NAME[args.benchmark]
+        class_names = [class_names[i] for i in class_labels] # 类别名
+        # 映射
+        label_to_index = dict()
+        for i, lbl in enumerate(class_labels):
+            label_to_index[int(lbl)] = i
+
+        # 使用第一张 query 的掩码
+        query_mask = query_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)  # (H, W)
+        final_pred_mask = final_pred_mask[0].cpu().squeeze(0).numpy().astype(np.uint8)  # (H, W)
+
+        gt = np.zeros_like(query_mask)
+        pred = np.zeros_like(final_pred_mask)
+        for lbl, idx in label_to_index.items():
+            gt[query_mask == lbl] = idx
+            pred[final_pred_mask == lbl] = idx
+
+        # 高效计算混淆矩阵
+        # 先用 bincount 计算当前 batch 的混淆矩阵，然后加到原始 pixel_confusion_matrix 上
+        flat_gt = gt.flatten()
+        flat_pred = pred.flatten()
+        mask = (flat_gt >= 0) & (flat_gt < num_classes) & (flat_pred >= 0) & (flat_pred < num_classes)
+        inds = flat_gt[mask] * num_classes + flat_pred[mask]
+        batch_cm = np.bincount(inds, minlength=num_classes*num_classes).reshape(num_classes, num_classes)
+        pixel_confusion_matrix += batch_cm
+        
+        # 按每行归一化
+        norm_pixel_confusion_matrix = pixel_confusion_matrix.copy()
+        row_sum = norm_pixel_confusion_matrix.sum(axis=1, keepdims=True)
+        norm_pixel_confusion_matrix = pixel_confusion_matrix / (row_sum + 1e-6)
+        print(f"norm_pixel_confusion_matrix.shape: {norm_pixel_confusion_matrix.shape} class_labels: {class_labels}")
+
+        # 绘制混淆矩阵热力图, 表明每个方块内的数值
+        plt.figure(figsize=(len(class_labels) * 2, len(class_labels) * 2))
+        plt.imshow(norm_pixel_confusion_matrix, cmap='jet', vmin=0, vmax=1)
+        plt.colorbar()
+        # 在每个方格内显示数值，并为每行的 top1/top2 绘制边框
+        for i in range(norm_pixel_confusion_matrix.shape[0]):
+            # 找出本行的 top2 索引
+            row = norm_pixel_confusion_matrix[i]
+            sorted_idx = np.argsort(row)[::-1]
+            top1 = sorted_idx[0]
+            top2 = sorted_idx[1] if sorted_idx.size > 1 else None
+            for j in range(norm_pixel_confusion_matrix.shape[1]):
+                txt = plt.text(j, i, f"{norm_pixel_confusion_matrix[i, j]: .2f}", ha='center', va='center', color='white', fontsize=12)
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='white')])
+            # 绘制 top1/top2 的矩形（坐标系以像素为单位，矩形左上角为 (col-0.5, row-0.5)）
+            rect1 = patches.Rectangle((top1 - 0.5, i - 0.5), 1, 1, linewidth=2.0, edgecolor='red', facecolor='none')
+            plt.gca().add_patch(rect1)
+            if top2 is not None:
+                rect2 = patches.Rectangle((top2 - 0.5, i - 0.5), 1, 1, linewidth=1.5, edgecolor='red', facecolor='none', linestyle='--')
+                plt.gca().add_patch(rect2)
+        plt.xticks(range(len(class_names)), class_names, rotation=45)
+        plt.yticks(range(len(class_names)), class_names)
+        plt.title('pixel confusion matrix')
+        plt.savefig('debug/norm_pixel_confusion_matrix.png')
+        plt.close()
+
+        # 绘制提示点混淆矩阵热力图
+        norm_prompt_confusion_matrix = prompt_confusion_matrix.copy()
+        row_sum = norm_prompt_confusion_matrix.sum(axis=1, keepdims=True)
+        norm_prompt_confusion_matrix = prompt_confusion_matrix / (row_sum + 1e-6)
+        plt.figure(figsize=(len(class_labels) * 2, len(class_labels) * 2))
+        plt.imshow(norm_prompt_confusion_matrix, cmap='jet', vmin=0, vmax=1)
+        plt.colorbar()
+        for i in range(norm_prompt_confusion_matrix.shape[0]):
+            row = norm_prompt_confusion_matrix[i]
+            sorted_idx = np.argsort(row)[::-1]
+            top1 = sorted_idx[0]
+            top2 = sorted_idx[1] if sorted_idx.size > 1 else None
+            for j in range(norm_prompt_confusion_matrix.shape[1]):
+                txt = plt.text(j, i, f"{norm_prompt_confusion_matrix[i, j]: .2f}", ha='center', va='center', color='white', fontsize=12)
+                txt.set_path_effects([path_effects.withStroke(linewidth=2, foreground='white')])
+            rect1 = patches.Rectangle((top1 - 0.5, i - 0.5), 1, 1, linewidth=2.0, edgecolor='red', facecolor='none')
+            plt.gca().add_patch(rect1)
+            if top2 is not None:
+                rect2 = patches.Rectangle((top2 - 0.5, i - 0.5), 1, 1, linewidth=1.5, edgecolor='red', facecolor='none', linestyle='--')
+                plt.gca().add_patch(rect2)
+        plt.xticks(range(len(class_names)), class_names, rotation=45)
+        plt.yticks(range(len(class_names)), class_names)
+        plt.savefig('debug/norm_prompt_confusion_matrix.png')
+        plt.close()
 
     # Write evaluation results
     average_meter.write_result(0)
@@ -194,7 +317,7 @@ if __name__ == '__main__':
     # 数据集参数
     parser.add_argument('--datapath', type=str, default='datasets')
     parser.add_argument('--benchmark', type=str, default='coco',
-                        choices=['fss', 'coco', 'pascal', 'lvis', 'paco_part', 'pascal_part', 'deepglobe', 'isic', 'isaid'])
+                        choices=['coco', 'pascal'])
     parser.add_argument('--bsz', type=int, default=1)
     parser.add_argument('--nworker', type=int, default=0)
     parser.add_argument('--fold', type=int, default=0)
